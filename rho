@@ -1,0 +1,615 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use DBI;
+use Time::HiRes qw(sleep);
+use POSIX qw(strftime);
+use Getopt::Long
+    qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
+
+sub usage;
+sub fatal;
+
+my $root = $ENV{'RHO_ROOT'};
+my $sources = {};
+my $rdbh;
+
+usage if !@ARGV;
+&{ __PACKAGE__->can('cmd_'.shift(@ARGV)) or usage };
+
+# --- Command handlers
+
+sub cmd_init {
+    usage if @ARGV != 1;
+    $root = shift @ARGV;
+    xmkdir($root);
+    xchdir($root);
+    my $dbh = init_root_db();
+}
+
+sub cmd_run {
+    orient();
+    usage if @ARGV < 1;
+    my $p = shift @ARGV;
+    my %arg = args(@ARGV);
+    xchdir('reports/'.$p);
+    my $report = read_report('report.rho');
+    %$sources = ( %$sources, %{ $report->{'sources'} || {} } );
+    check_args($report, \%arg);
+    xmkdir('out');
+    my ($o, $odbh, $odb) = make_output();
+    
+    $rdbh->do(
+        'INSERT INTO reports (proto, status, timestamp) VALUES (?, ?, ?)',
+        {},
+        $report->{'id'}, 'running', $o
+    );
+    my $rid = $rdbh->last_insert_id('', '', '', '');
+
+    my $init = $report->{'initializers'};
+    foreach my $q (ref($init) ? @$init: ($init)) {
+        my ($sth, @params) = prepare_sql($odbh, $q->{'body'}, \%arg);
+        $sth->execute(@params);
+    }
+
+    my $feeds = $report->{'feeds'};
+    foreach my $q (ref($feeds) ? @$feeds : ($feeds)) {
+        my ($r, $w) = @$q{qw(read write)};
+        my $source = $sources->{$r->{'source'} // 'default'} or die;
+        my ($rsth, @rparams) = prepare_sql(dbh($source), $r->{'body'}, \%arg);
+        my ($wsth, @wparams) = prepare_sql($odbh, $w->{'body'}, \%arg);
+        fatal "writer has external params" if @wparams;
+        $rsth->execute(@rparams);
+        while (my @row = $rsth->fetchrow_array) {
+            $wsth->execute(@row);
+        }
+    }
+
+    my $script = $report->{'script'};
+    if (defined $script) {
+        die 'not yet implemented';
+    }
+
+    my $finish = $report->{'finishers'};
+    foreach my $q (ref($finish) ? @$finish : ($finish)) {
+        my ($sth, @params) = prepare_sql($odbh, $q->{'body'}, \%arg);
+        $sth->execute(@params);
+    }
+
+    (my $rundb = $odb) =~ s{/.*}{/running.sqlite};
+    unlink $rundb;
+
+    # Record the successful run
+    $rdbh->do(
+        'UPDATE reports SET status = ? WHERE id = ?', 
+        {},
+        'done', $rid
+    );
+    
+    ### my $proto = read_hash_file('report.kv');
+    ### my $source = read_hash_file("$root/sources/$proto->{'source'}.kv");
+    ### my @fini = sort glob('ini*.sql');
+    ### my $fscr = -x 'script' && -f _ ? './script' : undef;
+    ### my @fsel = sort glob('sel*.sql');
+    ### my @fins = sort glob('ins*.sql');
+    ### my @ffin = sort glob('fin*.sql');
+    ### my @out;
+    ### if (defined $fscr) {
+    ###     fatal "script and SQL??" if @fsel || @fins;
+    ### }
+    ### elsif (@fsel == 1 && @fins == 1) {
+    ###     @out = [@fsel, @fins];
+    ### }
+    ### else {
+    ###     foreach my $fsel (sort @fsel) {
+    ###         (my $fins = $fsel) =~ s/^sel/ins/;
+    ###         fatal "no INSERT query for $fsel" if !-d $fins;
+    ###         push @out, [$fsel, $fins];
+    ###     }
+    ### }
+    ### 
+    ### my $source = $sources->{'reports'};
+    ### my $sdbh = DBI->connect(@$source{qw(dsn user password)});
+    ### foreach (@fini) {
+    ###     my ($sthini, @params) = prepare_sql_file($odbh, $_, \%param);
+    ###     $sthini->execute(@params);
+    ### }
+    ### if (defined $fscr) {
+    ###     run_script($fscr, $odb, \%param);
+    ### }
+    ### else {
+    ###     foreach (@out) {
+    ###         my ($fsel, $fins) = @$_;
+    ###         my ($sthsel, @params) = prepare_sql_file($sdbh, $fsel, \%param);
+    ###         my $sthins = prepare_sql_file($odbh, $fsel);
+    ###         $sthsel->execute(@params);
+    ###         while (my @row = $sthsel->fetchrow_array) {
+    ###             $sthins->execute(@row);
+    ###         }
+    ###     }
+    ### }
+    ### foreach (@ffin) {
+    ###     my ($sthfin, @params) = prepare_sql_file($odbh, $_, \%param);
+    ###     $sthfin->execute;
+    ### }
+}
+
+sub prepare_sql {
+    my ($dbh, $sql, $args) = @_;
+    my @bind;
+    $sql =~ s{
+        < ([\$\@]) (\w+) >
+    }{
+        placeholder($1, $2, $args->{$2}, \@bind)
+    }exg;
+    my $sth = $dbh->prepare($sql);
+    return ($sth, @bind);
+}
+
+sub placeholder {
+    my ($sigil, $key, $val, $bind) = @_;
+    if ($sigil eq '$') {
+        if (ref($val)) {
+            die if @$val > 1;
+            ($val) = @$val;
+        }
+        push @$bind, $val;
+        return '?';
+    }
+    elsif ($sigil eq '@') {
+        die if !$val;
+        $val = [$val] if !ref $val;
+        my @val = @$val;
+        push @$bind, @val;
+        return join(', ', '?' x scalar(@val));
+    }
+    else {
+        die "wtf?";
+    }
+}
+
+sub prepare_sql_file {
+    my ($dbh, $f, $params) = @_;
+    open my $fh, '<', $f or fatal "open $f: $!";
+    local $/;
+    my $sql = <$fh>;
+    my @params;
+    if ($sql =~ s{\A/\*\s*PARAMS\s*\*/\n}{}) {
+        while ($sql =~ s{\A/\*\s*([1-9][0-9]*)\s+(\S+)\s*\*/\n}{}) {
+            my ($i, $k) = ($1, $2);
+            $params[$i-1] = $params->{$k};
+        }
+    }
+    my $sth = $dbh->prepare($sql);
+    return ($sth, @params);
+}
+
+# --- Other functions
+
+sub orient {
+    GetOptions(
+        'r|root=s' => \$root,
+        @_,
+    ) or usage;
+    xchdir($root);
+    $sources = read_sources();
+    $rdbh = source_dbh('root');
+}
+
+sub init_root_db {
+    my $dbh = DBI->connect("dbi:SQLite:dbname=reports.sqlite", '', '');
+    $dbh->do($_) for split /;\n+/, <<'EOS';
+CREATE TABLE reports (
+    id          INTEGER PRIMARY KEY,
+    name        VARCHAR,
+    proto       INTEGER,
+    description VARCHAR,
+    timestamp   VARCHAR,
+    status      VARCHAR  /* proto, idle, running, etc. */
+);
+CREATE TABLE sources (
+    id          INTEGER PRIMARY KEY,
+    name        VARCHAR,
+    dsn         VARCHAR NOT NULL,
+    user        VARCHAR,
+    password    VARCHAR
+);
+CREATE TABLE parameters (
+    report      INTEGER NOT NULL,
+    key         VARCHAR,
+    name        VARCHAR,
+    description VARCHAR,
+    type        INTEGER,
+    value       VARCHAR
+);
+CREATE TABLE types (
+    id          INTEGER PRIMARY KEY,
+    numeric     VARCHAR,  /* i=integer, n=general numeric */
+    calendric   VARCHAR,  /* d=date, s=seconds since epoch */
+    list        VARCHAR,  /* separator if it's a list */
+    regexp      VARCHAR,
+    hint        VARCHAR,
+    example     VARCHAR
+);
+INSERT INTO sources
+        (id, name,          dsn,               user, password)
+VALUES  (1,  'FLO Voyager', 'dbi:Oracle:VGER', NULL, NULL    ),
+        (2,  'HELM Koha',   'dbi:mysql:...',   NULL, NULL    );
+EOS
+    return $rdbh = $dbh;
+}
+
+sub make_output {
+    my ($o, $odb);
+    while (1) {
+        $o = strftime('%Y%m%dT%H%M%S', localtime);
+        $odb = sprintf('out/%s.sqlite', $o);
+        last if !-e $odb;
+        sleep 0.1;
+    }
+    unlink('out/running.sqlite');
+    symlink(sprintf('%s.sqlite', $o), 'out/running.sqlite');
+    return ($o, source_dbh('report'), $odb);
+}
+
+sub source_dbh {
+    my ($s) = @_;
+    my $source = $sources->{$s} or fatal "no such source: $s";
+    return $source->{'dbh'} ||= DBI->connect(
+        $source->{'dsn'},
+        $source->{'user'},
+        $source->{'password'},
+    );
+}
+
+sub run_script {
+    my ($fscr, $o, $param) = @_;
+    my @params = map { $_ . '=' . $param->{$_} } keys %$param;
+    system($fscr, $o, @params) == 0 or fatal "script failed";
+}
+
+sub xchdir {
+    foreach my $dir (@_) {
+        chdir $dir or fatal "chdir $dir: $!";
+    }
+}
+
+sub xmkdir {
+    foreach my $dir (@_) {
+        -d $dir or mkdir $dir or fatal "mkdir $dir: $!";
+    }
+}
+
+sub get_source {
+    my ($s) = @_;
+    my $f = glob("sources/$s.src");
+    fatal "no such source: $s" if !defined $f;
+    return read_hash_file($f);
+}
+
+sub get_proto {
+    my ($p) = @_;
+    die 'not implemented';
+}
+
+sub read_hash_file {
+    my ($f) = @_;
+    open my $fh, '<', $f or fatal "open $f: $!";
+    my %hash;
+    while (<$fh>) {
+        next if /^\s*(?:#.*)?$/;  # Skip blank lines and comments
+        chomp;
+        /^(\S+)\s+(.*)$/ or fatal "unrecognized line in $f: $_";
+        $hash{$1} = $2;
+    }
+    return \%hash;
+}
+
+sub args {
+    my %param;
+    foreach (@_) {
+        my ($k, $v) = split /=/, $_, 2;
+        if (exists $param{$k}) {
+            $param{$k} = [ $param{$k} ] if !ref $param{$k};
+            push @{ $param{$k} }, $v;
+        }
+        else {
+            $param{$k} = $v;
+        }
+    }
+    return %param;
+}
+
+sub check_args {
+    my ($report, $args) = @_;
+    my $params = $report->{'parameters'};
+    # For example:
+    #   $params = {
+    #     'msg' => {
+    #       key => 'msg',
+    #       qualifiers => {
+    #         default => 'Hello world',
+    #       },
+    #       title => 'Message',
+    #     },
+    #   };
+    foreach my $param (values %$params) {
+        my $key = $param->{'key'};
+        my $qual = $param->{'qualifiers'} || {};
+        my $title = $param->{'title'};
+        if (!exists $args->{$key}) {
+            if (exists $qual->{'default'}) {
+                $args->{$key} = $qual->{'default'};
+            }
+            elsif ($qual->{'required'}) {
+                fatal "required parameter not specified: $key $title";
+            }
+        }
+    }
+}
+
+sub read_report {
+    my ($f) = @_;
+    my %report = (
+        'metadata' => {},
+        'parameters' => {},
+        'sources' => {},
+        'initializers' => [],
+        'feeds' => [],
+        'finishers' => [],
+    );
+    _read_file($f, \%report);
+}
+
+sub _read_file {
+    my ($f, $report, %limits) = @_;
+    open my $fh, '<', $f or die;
+    local $_;
+    {
+        local $/;
+        $_ = <$fh>;
+    }
+    my ($meta, $param, $source, $inits, $feeds, $finishers)
+        = @$report{qw(metadata parameters sources initializers feeds finishers)};
+    while (s/\A\s*(?=\S)//) {
+        _strip_comments();
+        my ($block, $type, $include);
+        if ($block = _metadata()) {
+            $type = 'metadata';
+            %$meta = ( %$meta, %{ $block->{'body'} } );
+        }
+        elsif ($block = _parameters()) {
+            $type = 'parameters';
+            %$param = ( %$param, %{ $block->{'body'} } );
+        }
+        elsif ($block = _source()) {
+            $type = 'sources';
+            my $id = $block->{'body'}{'id'} = delete $block->{'id'};
+            $block->{'body'}{'title'} = delete $block->{'title'};
+            %$source = ( %$source, $id => $block->{'body'} );
+        }
+        elsif ($block = _init()) {
+            $type = 'initializers';
+            push @$inits, $block;
+        }
+        elsif ($block = _feed()) {
+            $type = 'feeds';
+            push @$feeds, $block;
+        }
+        elsif ($block = _finish()) {
+            $type = 'finishers';
+            push @$finishers, $block;
+        }
+        elsif ($include = _include()) {
+            $type = 'include';
+        }
+        else {
+            my ($line) = split /\n/;
+            fatal "unparseable: line in file $f: $line";
+        }
+        if (defined $limits{$type} && (!$limits{$type} || !$limits{'*'})) {
+            fatal "unexpected block ($type) in file $f";
+        }
+        _read_file($include, $report, %limits) if $include;
+    }
+    return $report;
+}
+
+sub _strip_comments {
+    s{\A(\s*(?:#.*)?\n)+}{};
+}
+
+sub _metadata {
+    return _keyval_block(qr/meta(?:data)?/, sub {
+        local $_ = shift;
+        my ($k) = @_;
+        my $line = $k . ' ' . $_;
+        return _bareword() // _quoted_string_value() // fatal "invalid metadata: $line";
+    });
+}
+
+sub _feed {
+    my $read = _string_block('read') // return;
+    my $write = _string_block('write') // fatal "reader without writer";
+    return {
+        'read' => $read->{'body'},
+        'write' => $write->{'body'},
+    };
+}
+
+sub _source {
+    return _keyval_block(qr/source/, sub {
+        local $_ = shift;
+        my ($k) = @_;
+        my $line = $k . ' ' . $_;
+        if ($k =~ /^(dsn|user|password)$/) {
+            return _quoted_string_value() // fatal "invalid $k: $line";
+        }
+        elsif ($k eq 'options') {
+            my %opt;
+            while (/\S/) {
+                my $opt = _bareword() // fatal "expected option key: $line";
+                s/\A\s+//;
+                my $val = _quoted_string_value() // 1;
+                $opt{$opt} = $val;
+                s/\A\s*,//;  # Optional comma
+                s/\A\s+//;
+                last if s/\A;\s*//;
+            }
+            return \%opt;
+        }
+    });
+}
+
+sub _parameters {
+    return _keyval_block(qr/param(?:eter)?s/, sub {
+        local $_ = shift;
+        my ($k) = @_;
+        my $line = $k . ' ' . $_;
+        my $title = _quoted_string_value()
+            or fatal "untitled parameter: $line";
+        my %qual;
+        while (!s{\A\s*;\z}{}) {
+            s{\A\s+}{};
+            my $w = _bareword() or fatal "unrecognized token in parameter definition: $line";
+            if ($w =~ /^(default|hint|example|match(?:es|ing)?)$/) {
+                s{\A\s+}{} or fatal "parameter qualifier $w not followed by whitespace: $line";
+                my $v = _quoted_string_value() // _bareword()
+                    // fatal "parameter qualifier $w lacks required value: $line";
+                $qual{$w} = $v;
+            }
+            else {
+                $qual{$w} = 1;
+            }
+            s/\A\s*,//;  # Optional comma
+        }
+        return {
+            'key' => $k,
+            'title' => $title,
+            'qualifiers' => \%qual,
+        };
+    });
+}
+
+sub _init {
+    return _string_block('init');
+}
+
+sub _read {
+    my $block = _string_block('read');
+    1;
+}
+
+sub _write {
+    return _string_block('write');
+}
+
+sub _finish {
+    return _string_block('finish');
+}
+
+sub _include {
+    return if !s/\Ainclude\s+//;
+    my $f = _filepath()
+        or fatal "include without file argument";
+    return $f;
+}
+
+sub _string_block {
+    my ($rxhead) = @_;
+    return if !s{
+        \A
+        ($rxhead)
+        (?:
+            \s+ (\w+)
+        )?
+        (?:
+            \s+ "([^"\n]+)"
+        )?
+        \s+
+        \{
+    }{}x;
+    my $body = '';
+    my %block = ('type' => $1, 'id' => $2, 'title' => $3);
+    while (!s{\A\s*\}}{}) {
+        fatal if !s{(.+\n)}{};
+        $body .= $1;
+    }
+    $block{'body'} = $body;
+    return \%block;
+}
+
+sub _keyval_block {
+    my ($rxhead, $linesub) = @_;
+    return if !s{
+        \A
+        ($rxhead)
+        (?:
+            \s+ (\w+)
+        )?
+        (?:
+            \s+ "([^"\n]+)"
+        )?
+        \s+
+        \{
+    }{}x;
+    my %hash;
+    my %block = ('type' => $1, 'id' => $2, 'title' => $3, 'body' => \%hash);
+    while (1) {
+        _strip_comments();
+        last if s{\A\s*\}}{};
+        fatal "unterminated block" if !/\S/;
+        s{\A\s*(\w+)\s+(.+)\n}{}
+            or fatal "unrecognized line in $block{'type'}: $_";
+        $hash{$1} = $linesub->($2, $1);
+    }
+    return \%block;
+}
+
+sub _bareword {
+    return if !s/\A(\w+)//;
+    return $1;
+}
+
+sub _filepath {
+    return $1 if s/\A(\S+)//;
+    return _quoted_string_value();
+}
+
+sub _quoted_string_value {
+    return if !s/\A"((?:\\.|[^\\"\n])*)"//;
+    return unescape($1);
+}
+
+sub unescape {
+    local $_ = shift;
+    s{\\(.)}{$1}g;
+    return $_;
+}
+
+sub read_sources {
+    my ($f) = @_;
+    $f //= 'sources.rho';
+    open my $fh, '<', $f or fatal "open $f: $!";
+    local $/;
+    local $_ = <$fh>;
+    close $fh;
+    my %source;
+    _strip_comments();
+    while (my $block = _source()) {
+        my $hash = delete $block->{'body'};
+        %$hash = ( %$block, %$hash );
+        my $id = $hash->{'id'} || 'default';
+        $source{$id} = $hash;
+        _strip_comments();
+    }
+    return \%source;
+}
+
+sub fatal {
+    print STDERR "rho: @_\n";
+    exit 2;
+}
+
