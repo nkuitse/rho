@@ -1,0 +1,63 @@
+include ../../sources.rho
+
+metadata {
+    id        123;
+    name      "Recent hires";
+    author    "Ulysses K. Fishwick <fishwick@example.org>";
+}
+
+parameters {
+    hdaf  "Hired on or after" date match "^[0-9]{2}-[A-Z]{3}-[0-9]{4}";
+    depts "Department(s)" list;
+}
+
+# Where the report data comes from
+source {
+    dsn       "dbi:Oracle:HRMAINDB";
+    user      "foo";
+    password  "********";
+    options   FetchHashKeyName "NAME_lc", ReadOnly;
+}
+
+# Create the table that holds the main report data
+init "Recent hires" {
+    CREATE TABLE hires (
+        "Employee ID"   INTEGER,
+        "Name"          VARCHAR,
+        "Hire Date"     VARCHAR,
+        "Department"    VARCHAR
+    )
+}
+
+# Create the summary table
+init "Summary by department" {
+    CREATE TABLE summary (
+        "Number"        INTEGER,
+        "Department"    VARCHAR
+    )
+}
+
+# Fetch data from the source...
+read {
+    SELECT  e.employee_id,
+            e.last_name || ', ' || e.first_name,
+            e.date_hired,
+            d.department_name
+    FROM    employees e INNER JOIN departments d ON e.department_id = d.department_id
+    WHERE   e.date_hired > <$hdaf>
+    AND     d.department_name IN ( <@depts> )
+}
+
+# ...and save it in the report
+write {
+    INSERT  INTO "Recent Hires" ( "Employee ID", "Name", "Hire Date", "Department" )
+    VALUES  ( ?, ?, ?, ?, ? )
+}
+
+# Produce a summary to include in the report
+finish {
+    INSERT  INTO summary ( "Number", "Department" )
+    SELECT  count(*), "Department"
+    FROM    hires
+    GROUP   BY "Department"
+}

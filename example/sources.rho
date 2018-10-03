@@ -1,0 +1,12 @@
+# This file defines DBI connections for running SELECT queries against.
+
+# The root DB and currently running report are built in
+# source root { ... }
+# source report { ... }
+
+source foobar {
+    dsn       "dbi:Proxy:hostname=frodo;port=9999;dsn=dbi:Oracle:FOOBAR";
+    user      "luser123";
+    password  "password456";
+}
+

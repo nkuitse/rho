@@ -1,0 +1,24 @@
+include ../../sources.rho
+
+metadata {
+    id      2;
+    title   "Test report";
+    # source  report;
+}
+
+parameters {
+    msg     "Message" required;
+}
+
+init {
+    CREATE TABLE Messages (
+        Message     VARCHAR,
+        Timestamp   VARCHAR
+    )
+}
+
+finish {
+    INSERT INTO Messages ( Message, Timestamp )
+    VALUES ( <$msg>, strftime('%Y%m%dT%H%M%SZ', 'now') )
+}
+
