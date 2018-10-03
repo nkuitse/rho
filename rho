@@ -13,7 +13,7 @@ sub usage;
 sub fatal;
 
 my $root = $ENV{'RHO_ROOT'};
-my $sources = builtin_sources();
+my $sources;
 my $rdbh;
 
 usage if !@ARGV;
@@ -194,7 +194,10 @@ sub orient {
         @_,
     ) or usage;
     xchdir($root);
-    $sources = read_sources();
+    $sources = {
+        builtin_sources(),
+        read_sources(),
+    };
     $rdbh = source_dbh('root');
 }
 
@@ -389,7 +392,9 @@ sub _read_file {
             $type = 'sources';
             my $id = $block->{'body'}{'id'} = delete $block->{'id'};
             $block->{'body'}{'title'} = delete $block->{'title'};
-            %$source = ( %$source, $id => $block->{'body'} );
+            $source->{$id} = $block->{'body'};
+            ### my $hash = delete $block->{'body'};
+            ### %$hash = ( %$block, %$hash );
         }
         elsif ($block = _init()) {
             $type = 'initializers';
@@ -606,11 +611,11 @@ sub read_sources {
         $source{$id} = $hash;
         _strip_comments();
     }
-    return \%source;
+    return %source;
 }
 
 sub builtin_sources {
-    return {
+    return (
         'root' => {
             'id' => 0,
             'dsn' => 'dbi:SQLite:dbname=reports.sqlite',
@@ -623,7 +628,7 @@ sub builtin_sources {
             'user' => '',
             'password' => '',
         },
-    };
+    );
 }
 
 sub fatal {
