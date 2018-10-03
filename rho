@@ -13,7 +13,7 @@ sub usage;
 sub fatal;
 
 my $root = $ENV{'RHO_ROOT'};
-my $sources = {};
+my $sources = builtin_sources();
 my $rdbh;
 
 usage if !@ARGV;
@@ -233,10 +233,11 @@ CREATE TABLE types (
     hint        VARCHAR,
     example     VARCHAR
 );
+/* Built-in sources */
 INSERT INTO sources
-        (id, name,          dsn,               user, password)
-VALUES  (1,  'FLO Voyager', 'dbi:Oracle:VGER', NULL, NULL    ),
-        (2,  'HELM Koha',   'dbi:mysql:...',   NULL, NULL    );
+        (id, name,     dsn,                                    user, password)
+VALUES  (0,  'root',   'dbi:SQLite:dbname=reports.sqlite',     '',   ''      ),
+        (1,  'report', 'dbi:SQLite:dbname=out/running.sqlite', '',   ''      )
 EOS
     return $rdbh = $dbh;
 }
@@ -606,6 +607,23 @@ sub read_sources {
         _strip_comments();
     }
     return \%source;
+}
+
+sub builtin_sources {
+    return {
+        'root' => {
+            'id' => 0,
+            'dsn' => 'dbi:SQLite:dbname=reports.sqlite',
+            'user' => '',
+            'password' => '',
+        },
+        'report' => {
+            'id' => 1,
+            'dsn' => 'dbi:SQLite:dbname=out/running.sqlite',
+            'user' => '',
+            'password' => '',
+        },
+    };
 }
 
 sub fatal {
