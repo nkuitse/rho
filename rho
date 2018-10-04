@@ -4,17 +4,19 @@ use strict;
 use warnings;
 
 use DBI;
-use Time::HiRes qw(sleep);
+use Time::HiRes qw(sleep time);
 use POSIX qw(strftime);
+use Cwd qw(getcwd);
+use File::Basename qw(dirname basename);
 use Getopt::Long
     qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
 
 sub usage;
 sub fatal;
 
-my $root = $ENV{'RHO_ROOT'};
+my $root = $ENV{'RHO_ROOT'} || getcwd;
 my $sources;
-my $rdbh;
+my $log_dbh;
 
 usage if !@ARGV;
 &{ __PACKAGE__->can('cmd_'.shift(@ARGV)) or usage };
@@ -23,34 +25,55 @@ usage if !@ARGV;
 
 sub cmd_init {
     usage if @ARGV != 1;
-    $root = shift @ARGV;
-    xmkdir($root);
-    xchdir($root);
-    my $dbh = init_root_db();
+    my $log_dbfile = shift @ARGV;
+    $log_dbfile =~ m{^/}
+        or fatal "DB file path must be absolute";
+    my $log_dbdir = dirname($log_dbfile);
+    xmkdir($log_dbdir);
+    $log_dbh = init_log_db($log_dbfile);
+    print STDERR "Initialized: $log_dbfile\n";
 }
 
 sub cmd_run {
-    orient();
+    my $ofmt;
+    my $log_dbfile = $ENV{'RHO_LOGDB'};
+    orient(
+        'o|output=s' => \$ofmt,
+        'l|logdb=s' => \$log_dbfile,
+    );
     usage if @ARGV < 1;
-    my $p = shift @ARGV;
+    my $repfile = shift @ARGV;
     my %arg = args(@ARGV);
-    xchdir('reports/'.$p);
-    my $report = read_report('report.rho');
+
+    my $t0 = time;
+
+    xchdir(dirname($repfile));
+    my $report = read_report(basename($repfile));
     %$sources = ( %$sources, %{ $report->{'sources'} || {} } );
     check_args($report, \%arg);
-    xmkdir('out');
-    my ($o, $odbh, $odb) = make_output();
+    if (defined $log_dbfile) {
+        $sources->{'log'} = {
+            'dsn' => "dbi:SQLite:dbname=$log_dbfile",
+            'user' => '',
+            'password' => '',
+        };
+        $log_dbh = source_dbh('log');
+    }
+    my ($timestamp, $out_dbh, $out_dbfile) = make_output($ofmt // $report->{'metadata'}{'output'});
     
-    $rdbh->do(
-        'INSERT INTO reports (proto, status, timestamp) VALUES (?, ?, ?)',
-        {},
-        $report->{'id'}, 'running', $o
-    );
-    my $rid = $rdbh->last_insert_id('', '', '', '');
+    my $rid;
+    if ($log_dbh) {
+        $log_dbh->do(
+            'INSERT INTO reports (proto, status, timestamp, output) VALUES (?, ?, ?, ?)',
+            {},
+            $report->{'id'}, 'running', $timestamp, $out_dbfile
+        );
+        $rid = $log_dbh->last_insert_id('', '', '', '');
+    }
 
     my $init = $report->{'initializers'};
     foreach my $q (ref($init) ? @$init: ($init)) {
-        my ($sth, @params) = prepare_sql($odbh, $q->{'body'}, \%arg);
+        my ($sth, @params) = prepare_sql($out_dbh, $q->{'body'}, \%arg);
         $sth->execute(@params);
     }
 
@@ -58,8 +81,8 @@ sub cmd_run {
     foreach my $q (ref($feeds) ? @$feeds : ($feeds)) {
         my ($r, $w) = @$q{qw(read write)};
         my $source = $sources->{$r->{'source'} // 'default'} or die;
-        my ($rsth, @rparams) = prepare_sql(dbh($source), $r->{'body'}, \%arg);
-        my ($wsth, @wparams) = prepare_sql($odbh, $w->{'body'}, \%arg);
+        my ($rsth, @rparams) = prepare_sql(source_dbh($source), $r->{'body'}, \%arg);
+        my ($wsth, @wparams) = prepare_sql($out_dbh, $w->{'body'}, \%arg);
         fatal "writer has external params" if @wparams;
         $rsth->execute(@rparams);
         while (my @row = $rsth->fetchrow_array) {
@@ -74,66 +97,18 @@ sub cmd_run {
 
     my $finish = $report->{'finishers'};
     foreach my $q (ref($finish) ? @$finish : ($finish)) {
-        my ($sth, @params) = prepare_sql($odbh, $q->{'body'}, \%arg);
+        my ($sth, @params) = prepare_sql($out_dbh, $q->{'body'}, \%arg);
         $sth->execute(@params);
     }
 
-    (my $rundb = $odb) =~ s{/.*}{/running.sqlite};
-    unlink $rundb;
-
     # Record the successful run
-    $rdbh->do(
-        'UPDATE reports SET status = ? WHERE id = ?', 
-        {},
-        'done', $rid
-    );
-    
-    ### my $proto = read_hash_file('report.kv');
-    ### my $source = read_hash_file("$root/sources/$proto->{'source'}.kv");
-    ### my @fini = sort glob('ini*.sql');
-    ### my $fscr = -x 'script' && -f _ ? './script' : undef;
-    ### my @fsel = sort glob('sel*.sql');
-    ### my @fins = sort glob('ins*.sql');
-    ### my @ffin = sort glob('fin*.sql');
-    ### my @out;
-    ### if (defined $fscr) {
-    ###     fatal "script and SQL??" if @fsel || @fins;
-    ### }
-    ### elsif (@fsel == 1 && @fins == 1) {
-    ###     @out = [@fsel, @fins];
-    ### }
-    ### else {
-    ###     foreach my $fsel (sort @fsel) {
-    ###         (my $fins = $fsel) =~ s/^sel/ins/;
-    ###         fatal "no INSERT query for $fsel" if !-d $fins;
-    ###         push @out, [$fsel, $fins];
-    ###     }
-    ### }
-    ### 
-    ### my $source = $sources->{'reports'};
-    ### my $sdbh = DBI->connect(@$source{qw(dsn user password)});
-    ### foreach (@fini) {
-    ###     my ($sthini, @params) = prepare_sql_file($odbh, $_, \%param);
-    ###     $sthini->execute(@params);
-    ### }
-    ### if (defined $fscr) {
-    ###     run_script($fscr, $odb, \%param);
-    ### }
-    ### else {
-    ###     foreach (@out) {
-    ###         my ($fsel, $fins) = @$_;
-    ###         my ($sthsel, @params) = prepare_sql_file($sdbh, $fsel, \%param);
-    ###         my $sthins = prepare_sql_file($odbh, $fsel);
-    ###         $sthsel->execute(@params);
-    ###         while (my @row = $sthsel->fetchrow_array) {
-    ###             $sthins->execute(@row);
-    ###         }
-    ###     }
-    ### }
-    ### foreach (@ffin) {
-    ###     my ($sthfin, @params) = prepare_sql_file($odbh, $_, \%param);
-    ###     $sthfin->execute;
-    ### }
+    if ($log_dbh) {
+        $log_dbh->do(
+            'UPDATE reports SET status = ?, duration = ? WHERE id = ?', 
+            {},
+            'done', $rid, time - $t0
+        );
+    }
 }
 
 sub prepare_sql {
@@ -189,20 +164,21 @@ sub prepare_sql_file {
 # --- Other functions
 
 sub orient {
+    my @sources;
     GetOptions(
         'r|root=s' => \$root,
+        's|source=s' => \@sources,
         @_,
     ) or usage;
     xchdir($root);
     $sources = {
-        builtin_sources(),
-        read_sources(),
+        map { read_sources($_) } @sources
     };
-    $rdbh = source_dbh('root');
 }
 
-sub init_root_db {
-    my $dbh = DBI->connect("dbi:SQLite:dbname=reports.sqlite", '', '');
+sub init_log_db {
+    my ($dbfile) = @_;
+    my $dbh = DBI->connect("dbi:SQLite:dbname=$dbfile", '', '');
     $dbh->do($_) for split /;\n+/, <<'EOS';
 CREATE TABLE reports (
     id          INTEGER PRIMARY KEY,
@@ -210,6 +186,8 @@ CREATE TABLE reports (
     proto       INTEGER,
     description VARCHAR,
     timestamp   VARCHAR,
+    duration    INTEGER,
+    output      VARCHAR,
     status      VARCHAR  /* proto, idle, running, etc. */
 );
 CREATE TABLE sources (
@@ -236,36 +214,36 @@ CREATE TABLE types (
     hint        VARCHAR,
     example     VARCHAR
 );
+EOS
+    $dbh->do(<<"EOS");
 /* Built-in sources */
 INSERT INTO sources
-        (id, name,     dsn,                                    user, password)
-VALUES  (0,  'root',   'dbi:SQLite:dbname=reports.sqlite',     '',   ''      ),
-        (1,  'report', 'dbi:SQLite:dbname=out/running.sqlite', '',   ''      )
+        (id, name,  dsn,                         user, password)
+VALUES  (0,  'log', 'dbi:SQLite:dbname=$dbfile', '',   ''      )
 EOS
-    return $rdbh = $dbh;
+    return $log_dbh = $dbh;
 }
 
 sub make_output {
-    my ($o, $odb);
-    while (1) {
-        $o = strftime('%Y%m%dT%H%M%S', localtime);
-        $odb = sprintf('out/%s.sqlite', $o);
-        last if !-e $odb;
-        sleep 0.1;
-    }
-    unlink('out/running.sqlite');
-    symlink(sprintf('%s.sqlite', $o), 'out/running.sqlite');
-    return ($o, source_dbh('report'), $odb);
+    my ($ofmt) = @_;
+    my $timestamp = strftime('%Y%m%dT%H%M%S', localtime);
+    $ofmt //= "out/$timestamp.sqlite";
+    my $out_dbfile = strftime($ofmt, localtime);
+    my $odir = dirname($out_dbfile);
+    xmkdir($odir);
+    $sources->{'report'} = {
+        'id' => 1,
+        'dsn' => "dbi:SQLite:dbname=$out_dbfile",
+        'user' => '',
+        'password' => '',
+    };
+    return ($timestamp, source_dbh('report'), $out_dbfile);
 }
 
 sub source_dbh {
     my ($s) = @_;
-    my $source = $sources->{$s} or fatal "no such source: $s";
-    return $source->{'dbh'} ||= DBI->connect(
-        $source->{'dsn'},
-        $source->{'user'},
-        $source->{'password'},
-    );
+    my $source = ref($s) ? $s : $sources->{$s} // fatal "no such source: $s";
+    return $source->{'dbh'} ||= DBI->connect(@$source{qw(dsn user password)});
 }
 
 sub run_script {
@@ -432,7 +410,8 @@ sub _metadata {
         local $_ = shift;
         my ($k) = @_;
         my $line = $k . ' ' . $_;
-        return _bareword() // _quoted_string_value() // fatal "invalid metadata: $line";
+        return _bareword() // _filepath() //_quoted_string_value()
+            // fatal "invalid metadata: $line";
     });
 }
 
@@ -580,7 +559,7 @@ sub _bareword {
 }
 
 sub _filepath {
-    return $1 if s/\A(\S+)//;
+    return $1 if s{\A(\.{0,2}/[^\s;]+)}{};
     return _quoted_string_value();
 }
 
@@ -597,7 +576,6 @@ sub unescape {
 
 sub read_sources {
     my ($f) = @_;
-    $f //= 'sources.rho';
     open my $fh, '<', $f or fatal "open $f: $!";
     local $/;
     local $_ = <$fh>;
@@ -612,23 +590,6 @@ sub read_sources {
         _strip_comments();
     }
     return %source;
-}
-
-sub builtin_sources {
-    return (
-        'root' => {
-            'id' => 0,
-            'dsn' => 'dbi:SQLite:dbname=reports.sqlite',
-            'user' => '',
-            'password' => '',
-        },
-        'report' => {
-            'id' => 1,
-            'dsn' => 'dbi:SQLite:dbname=out/running.sqlite',
-            'user' => '',
-            'password' => '',
-        },
-    );
 }
 
 sub fatal {
