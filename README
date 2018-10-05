@@ -1,3 +1,43 @@
-rho - a report runner and manager
+rho - move data in rows from database to database
 
+A rho report consists of one or more steps.  Each step is a pair of SQL
+statements -- one to extract rows of data from one database, the other to write
+the rows to another database.  ("rho" = "row" respelled.)
 
+For example, the first step (a "reader") might gather recent sales data from
+one DB and write a summary to another DB.
+
+A rho "report" for this purpose might be defined like this:
+
+    db sales {
+        dsn "dbi:Oracle:..."
+        user "log_user"
+        password "********"
+    }
+    db stats {
+        dsn "dbi:mysql:..."
+        user "stats"
+        password "********"
+    }
+    read from sales {
+        SELECT  COUNT(*), SUM(total), AVG(total), category
+        FROM    sales
+        WHERE   timestamp >= SYSDATE() - 7
+        GROUP BY category;
+    }
+    write to stats {
+        INSERT INTO monthly_sales (num_sales, total_amount, avg_amount, category, time_period)
+        VALUES (?, ?, ?, ?, <$period>);
+    }
+    parameters {
+        period required type date description "Time period";
+    }
+
+The placeholder "<$period>" in the writer will be filled in by an argument that
+must be supplied on the command line.  To run the report:
+
+    $ rho FILE period=201810/P1M
+
+The most obvious use for this is as one part in a complete report-generating
+system -- other parts might create a spreadsheet from the resulting database,
+for example -- but you may be able to think of other uses.
