@@ -1,9 +1,9 @@
-include ../../sources.rho
+include ../../endpoints.rho
 
 metadata {
     id      2;
     title   "Test report";
-    # source  report;
+    output  "out/%Y%m%d.sqlite";
 }
 
 parameters {

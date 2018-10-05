@@ -1,0 +1,32 @@
+metadata {
+    title   "Another test report";
+}
+
+source foo {
+    dsn "dbi:SQLite:dbname=example2.source.sqlite";
+    user "";
+    password "";
+}
+
+output {
+    dsn "dbi:SQLite:dbname=example2.output.sqlite";
+    user "";
+    password "";
+}
+
+initialize output {
+    CREATE TABLE IF NOT EXISTS tally (
+        number      INTEGER,
+        timestamp   VARCHAR
+    );
+}
+
+read from foo {
+    SELECT COUNT(*), strftime('%Y%m%dT%H%M%SZ', 'now') FROM stuff;
+}
+
+write to output {
+    INSERT INTO tally (number, timestamp)
+    VALUES (?, ?)
+}
+
