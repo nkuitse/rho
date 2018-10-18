@@ -24,10 +24,6 @@ run();
 # --- Functions
 
 sub run {
-    my $ofmt;
-    orient(
-        'o|output=s' => \$ofmt,
-    );
     usage if @ARGV < 1;
     my $repfile = shift @ARGV;
     my %arg = args(@ARGV);
@@ -176,22 +172,6 @@ CREATE TABLE arguments (
 );
 EOS
     return $dbh;
-}
-
-sub make_output {
-    my ($ofmt) = @_;
-    my $timestamp = strftime('%Y%m%dT%H%M%S', localtime);
-    $ofmt //= "out/$timestamp.sqlite";
-    my $out_dbfile = strftime($ofmt, localtime);
-    my $odir = dirname($out_dbfile);
-    xmkdir($odir);
-    $endpoint{'output'} = {
-        'id' => 'output',
-        'dsn' => "dbi:SQLite:dbname=$out_dbfile",
-        'user' => '',
-        'password' => '',
-    };
-    return ($timestamp, endpoint_dbh('output'), $out_dbfile);
 }
 
 sub endpoint_dbh {
