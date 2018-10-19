@@ -15,7 +15,7 @@ sub usage;
 sub fatal;
 
 my $root = $ENV{'RHO_ROOT'} || getcwd;
-my %endpoint;
+my %database;
 my %trx;
 
 usage if !@ARGV;
@@ -30,24 +30,24 @@ sub run {
     my $t0 = time;
     xchdir(dirname($repfile));
     my $report = read_report(basename($repfile));
-    %endpoint = ( %endpoint, %{ $report->{'endpoints'} || {} } );
+    %database = ( %database, %{ $report->{'databases'} || {} } );
     check_args($report, \%arg);
     my $init = $report->{'initializers'};
     foreach my $q (ref($init) ? @$init: ($init)) {
-        my $e = $q->{'target'};
-        my $dbh = begin(endpoint_dbh($e));
+        my $db = $q->{'target'};
+        my $dbh = begin(dbh($db));
         my ($sth, @params) = prepare_sql($dbh, $q->{'body'}, \%arg);
         $sth->execute(@params);
     }
     my $feeds = $report->{'feeds'};
     foreach my $q (ref($feeds) ? @$feeds : ($feeds)) {
         my ($r, $w) = @$q{qw(read write)};
-        die "attempt to write to a read-only endpoint $r->{'id'}"
+        die "attempt to write to a read-only database $r->{'id'}"
             if $w->{'read_only'};
-        my $reader = $endpoint{$r->{'id'}} or die;
-        my $writer = $endpoint{$w->{'id'}} or die;
-        my $wdbh = begin(endpoint_dbh($writer));
-        my ($rsth, @rparams) = prepare_sql(endpoint_dbh($reader), $r->{'body'}, \%arg);
+        my $reader = $database{$r->{'id'}} or die;
+        my $writer = $database{$w->{'id'}} or die;
+        my $wdbh = begin(dbh($writer));
+        my ($rsth, @rparams) = prepare_sql(dbh($reader), $r->{'body'}, \%arg);
         my ($wsth, @wparams) = prepare_sql($wdbh, $w->{'body'}, \%arg);
         fatal "writer has external params" if @wparams;
         $rsth->execute(@rparams);
@@ -61,8 +61,8 @@ sub run {
     }
     my $finish = $report->{'finishers'};
     foreach my $q (ref($finish) ? @$finish : ($finish)) {
-        my $e = $q->{'target'};
-        my $dbh = begin(endpoint_dbh($e));
+        my $db = $q->{'target'};
+        my $dbh = begin(dbh($db));
         my ($sth, @params) = prepare_sql($dbh, $q->{'body'}, \%arg);
         $sth->execute(@params);
     }
@@ -138,46 +138,20 @@ sub prepare_sql_file {
 # --- Other functions
 
 sub orient {
-    my @endpoints;
+    my @databases;
     GetOptions(
         'r|root=s' => \$root,
-        's|endpoint=s' => \@endpoints,
+        's|database=s' => \@databases,
         @_,
     ) or usage;
     xchdir($root);
-    %endpoint = read_endpoints(@endpoints);
+    %database = read_databases(@databases);
 }
 
-sub init_log_db {
-    my ($dbfile) = @_;
-    my $dbh = DBI->connect("dbi:SQLite:dbname=$dbfile", '', '', { 'RaiseError' => 1, 'AutoCommit' => 1 });
-    $dbh->do($_) for split /;\n+/, <<'EOS';
-CREATE TABLE reports (
-    id          INTEGER PRIMARY KEY,
-    name        VARCHAR,
-    proto       INTEGER,
-    description VARCHAR,
-    timestamp   VARCHAR,
-    duration    INTEGER,
-    output      VARCHAR,
-    status      VARCHAR  /* proto, idle, running, etc. */
-);
-CREATE TABLE arguments (
-    report      INTEGER NOT NULL,
-    key         VARCHAR,
-    name        VARCHAR,
-    description VARCHAR,
-    type        INTEGER,
-    value       VARCHAR
-);
-EOS
-    return $dbh;
-}
-
-sub endpoint_dbh {
-    my ($e) = @_;
-    my $endpoint = ref($e) ? $e : $endpoint{$e} // fatal "no such endpoint: $e";
-    return $endpoint->{'dbh'} ||= DBI->connect(@$endpoint{qw(dsn user password)}, { 'RaiseError' => 1, 'AutoCommit' => 1 });
+sub dbh {
+    my ($db) = @_;
+    my $database = ref($db) ? $db : $database{$db} // fatal "no such database: $db";
+    return $database->{'dbh'} ||= DBI->connect(@$database{qw(dsn user password)}, { 'RaiseError' => 1, 'AutoCommit' => 1 });
 }
 
 sub run_script {
@@ -246,7 +220,7 @@ sub read_report {
     my %report = (
         'metadata' => {},
         'parameters' => {},
-        'endpoints' => {},
+        'databases' => {},
         'initializers' => [],
         'feeds' => [],
         'finishers' => [],
@@ -262,8 +236,8 @@ sub _read_file {
         local $/;
         $_ = <$fh>;
     }
-    my ($meta, $param, $endpoint, $inits, $feeds, $finishers)
-        = @$report{qw(metadata parameters endpoints initializers feeds finishers)};
+    my ($meta, $param, $database, $inits, $feeds, $finishers)
+        = @$report{qw(metadata parameters databases initializers feeds finishers)};
     while (s/\A\s*(?=\S)//) {
         _strip_comments();
         my ($block, $type, $include);
@@ -275,11 +249,11 @@ sub _read_file {
             $type = 'parameters';
             %$param = ( %$param, %{ $block->{'body'} } );
         }
-        elsif ($block = _endpoint()) {
-            $type = 'endpoints';
+        elsif ($block = _database()) {
+            $type = 'databases';
             my $id = $block->{'body'}{'id'} = delete $block->{'id'};
             $block->{'body'}{'title'} = delete $block->{'title'};
-            $endpoint->{$id} = $block->{'body'};
+            $database->{$id} = $block->{'body'};
             ### my $hash = delete $block->{'body'};
             ### %$hash = ( %$block, %$hash );
         }
@@ -348,11 +322,11 @@ sub _read_block {
         from
         \s+
     }{}x;
-    my $endpoint = _bareword() // fatal("expected endpoint ID: ", (split /\n/, $_, 2)[0]);
+    my $database = _bareword() // fatal("expected database ID: ", (split /\n/, $_, 2)[0]);
     fatal "incomplete read block"
         if !s{\A\s+\{\s*}{};
     my $body = '';
-    my %block = ('id' => $endpoint);
+    my %block = ('id' => $database);
     while (!s{\A\s*\}}{}) {
         fatal if !s{(.+\n)}{};
         $body .= $1;
@@ -375,9 +349,9 @@ sub _write_block {
         \s+
         \{
     }{}x;
-    my $endpoint = $1 // 'output';
+    my $database = $1 // 'output';
     my $body = '';
-    my %block = ('id' => $endpoint);
+    my %block = ('id' => $database);
     while (!s{\A\s*\}}{}) {
         fatal if !s{(.+\n)}{};
         $body .= $1;
@@ -386,8 +360,8 @@ sub _write_block {
     return \%block;
 }
 
-sub _endpoint {
-    return _keyval_block(qr/(endpoint|source|destination|output)/, sub {
+sub _database {
+    return _keyval_block(qr/(database|source|destination|output)/, sub {
         local $_ = shift;
         my ($k, $block) = @_;
         $block->{'read_only'} = 1 if $block->{'type'} eq 'source';
@@ -537,23 +511,23 @@ sub unescape {
     return $_;
 }
 
-sub read_endpoints {
+sub read_databases {
     foreach my $f (@_) {
         open my $fh, '<', $f or fatal "open $f: $!";
         local $/;
         local $_ = <$fh>;
         close $fh;
-        my %endpoint;
+        my %database;
         _strip_comments();
-        while (my $block = _endpoint()) {
+        while (my $block = _database()) {
             my $hash = delete $block->{'body'};
             %$hash = ( %$block, %$hash );
             my $id = $hash->{'id'} || 'default';
-            $endpoint{$id} = $hash;
+            $database{$id} = $hash;
             _strip_comments();
         }
     }
-    return %endpoint;
+    return %database;
 }
 
 sub fatal {
