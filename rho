@@ -39,8 +39,8 @@ sub run {
         my ($sth, @params) = prepare_sql($dbh, $q->{'body'}, \%arg);
         $sth->execute(@params);
     }
-    my $feeds = $report->{'feeds'};
-    foreach my $q (ref($feeds) ? @$feeds : ($feeds)) {
+    my $iosteps = $report->{'iosteps'};
+    foreach my $q (ref($iosteps) ? @$iosteps : ($iosteps)) {
         my ($r, $w) = @$q{qw(read write)};
         die "attempt to write to a read-only database $r->{'id'}"
             if $w->{'read_only'};
@@ -222,7 +222,7 @@ sub read_report {
         'parameters' => {},
         'databases' => {},
         'initializers' => [],
-        'feeds' => [],
+        'iosteps' => [],
         'finishers' => [],
     );
     _read_file($f, \%report);
@@ -236,8 +236,8 @@ sub _read_file {
         local $/;
         $_ = <$fh>;
     }
-    my ($meta, $param, $database, $inits, $feeds, $finishers)
-        = @$report{qw(metadata parameters databases initializers feeds finishers)};
+    my ($meta, $param, $database, $inits, $iosteps, $finishers)
+        = @$report{qw(metadata parameters databases initializers iosteps finishers)};
     while (s/\A\s*(?=\S)//) {
         _strip_comments();
         my ($block, $type, $include);
@@ -261,9 +261,9 @@ sub _read_file {
             $type = 'initializers';
             push @$inits, $block;
         }
-        elsif ($block = _feed()) {
-            $type = 'feeds';
-            push @$feeds, $block;
+        elsif ($block = _iostep()) {
+            $type = 'iosteps';
+            push @$iosteps, $block;
         }
         elsif ($block = _finish()) {
             $type = 'finishers';
@@ -302,7 +302,7 @@ sub _metadata {
     });
 }
 
-sub _feed {
+sub _iostep {
     my $read = _read_block() // return;  # _string_block('read') // return;
     _strip_comments();
     _strip_whitespace();
