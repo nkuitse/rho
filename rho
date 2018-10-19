@@ -14,7 +14,6 @@ use Getopt::Long
 sub usage;
 sub fatal;
 
-my $root = $ENV{'RHO_ROOT'} || getcwd;
 my %database;
 my %trx;
 
@@ -137,17 +136,6 @@ sub prepare_sql_file {
 
 # --- Other functions
 
-sub orient {
-    my @databases;
-    GetOptions(
-        'r|root=s' => \$root,
-        's|database=s' => \@databases,
-        @_,
-    ) or usage;
-    xchdir($root);
-    %database = read_databases(@databases);
-}
-
 sub dbh {
     my ($db) = @_;
     my $database = ref($db) ? $db : $database{$db} // fatal "no such database: $db";
@@ -254,8 +242,6 @@ sub _read_file {
             my $id = $block->{'body'}{'id'} = delete $block->{'id'};
             $block->{'body'}{'title'} = delete $block->{'title'};
             $database->{$id} = $block->{'body'};
-            ### my $hash = delete $block->{'body'};
-            ### %$hash = ( %$block, %$hash );
         }
         elsif ($block = _init()) {
             $type = 'initializers';
@@ -509,25 +495,6 @@ sub unescape {
     local $_ = shift;
     s{\\(.)}{$1}g;
     return $_;
-}
-
-sub read_databases {
-    foreach my $f (@_) {
-        open my $fh, '<', $f or fatal "open $f: $!";
-        local $/;
-        local $_ = <$fh>;
-        close $fh;
-        my %database;
-        _strip_comments();
-        while (my $block = _database()) {
-            my $hash = delete $block->{'body'};
-            %$hash = ( %$block, %$hash );
-            my $id = $hash->{'id'} || 'default';
-            $database{$id} = $hash;
-            _strip_comments();
-        }
-    }
-    return %database;
 }
 
 sub fatal {
