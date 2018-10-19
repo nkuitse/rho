@@ -4,9 +4,6 @@ use strict;
 use warnings;
 
 use DBI;
-use Time::HiRes qw(sleep time);
-use POSIX qw(strftime);
-use Cwd qw(getcwd);
 use File::Basename qw(dirname basename);
 use Getopt::Long
     qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
@@ -16,7 +13,11 @@ sub fatal;
 
 my %database;
 my %trx;
+my ($verbose);
 
+GetOptions(
+    'v|verbose' => \$verbose,
+);
 usage if !@ARGV;
 run();
 
@@ -26,25 +27,34 @@ sub run {
     usage if @ARGV < 1;
     my $repfile = shift @ARGV;
     my %arg = args(@ARGV);
-    my $t0 = time;
     xchdir(dirname($repfile));
+    print STDERR "Parsing report file......" if $verbose;
     my $report = read_report(basename($repfile));
+    print STDERR "OK\n" if $verbose;
     %database = ( %database, %{ $report->{'databases'} || {} } );
+    print STDERR "Checking arguments......." if $verbose;
     check_args($report, \%arg);
+    print STDERR "OK\n" if $verbose;
     my $init = $report->{'initializers'};
-    foreach my $q (ref($init) ? @$init: ($init)) {
+    my @inits = ref($init) ? @$init: ($init);
+    print STDERR "Running initializer(s)..." if $verbose && @inits;
+    foreach my $q (@inits) {
         my $db = $q->{'target'};
         my $dbh = begin(dbh($db));
         my ($sth, @params) = prepare_sql($dbh, $q->{'body'}, \%arg);
         $sth->execute(@params);
     }
+    print STDERR "OK\n" if $verbose && @inits;
     my $iosteps = $report->{'iosteps'};
-    foreach my $q (ref($iosteps) ? @$iosteps : ($iosteps)) {
+    my $nrows = 0;
+    my @iosteps = ref($iosteps) ? @$iosteps : ($iosteps);
+    print STDERR "Generating report........" if $verbose && @iosteps;
+    foreach my $q (@iosteps) {
         my ($r, $w) = @$q{qw(read write)};
+        my $reader = $database{$r->{'id'}} or fatal "no such database: $r->{'id'}";
+        my $writer = $database{$w->{'id'}} or fatal "no such database: $w->{'id'}";
         die "attempt to write to a read-only database $r->{'id'}"
-            if $w->{'read_only'};
-        my $reader = $database{$r->{'id'}} or die;
-        my $writer = $database{$w->{'id'}} or die;
+            if $writer->{'read_only'};
         my $wdbh = begin(dbh($writer));
         my ($rsth, @rparams) = prepare_sql(dbh($reader), $r->{'body'}, \%arg);
         my ($wsth, @wparams) = prepare_sql($wdbh, $w->{'body'}, \%arg);
@@ -52,20 +62,27 @@ sub run {
         $rsth->execute(@rparams);
         while (my @row = $rsth->fetchrow_array) {
             $wsth->execute(@row);
+            $nrows++;
         }
     }
-    my $script = $report->{'script'};
-    if (defined $script) {
-        die 'not yet implemented';
-    }
+    print STDERR "OK\n" if $verbose && @iosteps;
     my $finish = $report->{'finishers'};
-    foreach my $q (ref($finish) ? @$finish : ($finish)) {
+    my @finish = ref($finish) ? @$finish : ($finish);
+    print STDERR "Running finisher(s)..." if $verbose && @finish;
+    foreach my $q (@finish) {
         my $db = $q->{'target'};
         my $dbh = begin(dbh($db));
         my ($sth, @params) = prepare_sql($dbh, $q->{'body'}, \%arg);
         $sth->execute(@params);
     }
+    print STDERR "OK\n" if $verbose && @finish;
     end();
+    if ($nrows == 1) {
+        print STDERR "$nrows row read and written\n";
+    }
+    else {
+        print STDERR "$nrows rows read and written\n";
+    }
 }
 
 sub begin {
@@ -140,12 +157,6 @@ sub dbh {
     my ($db) = @_;
     my $database = ref($db) ? $db : $database{$db} // fatal "no such database: $db";
     return $database->{'dbh'} ||= DBI->connect(@$database{qw(dsn user password)}, { 'RaiseError' => 1, 'AutoCommit' => 1 });
-}
-
-sub run_script {
-    my ($fscr, $o, $param) = @_;
-    my @params = map { $_ . '=' . $param->{$_} } keys %$param;
-    system($fscr, $o, @params) == 0 or fatal "script failed";
 }
 
 sub xchdir {
@@ -239,9 +250,9 @@ sub _read_file {
         }
         elsif ($block = _database()) {
             $type = 'databases';
-            my $id = $block->{'body'}{'id'} = delete $block->{'id'};
-            $block->{'body'}{'title'} = delete $block->{'title'};
-            $database->{$id} = $block->{'body'};
+            %$block = ( %$block, %{ $block->{'body'} } );
+            my $id = $block->{'id'};
+            $database->{$id} = $block;
         }
         elsif ($block = _init()) {
             $type = 'initializers';
@@ -495,6 +506,11 @@ sub unescape {
     local $_ = shift;
     s{\\(.)}{$1}g;
     return $_;
+}
+
+sub usage {
+    print STDERR "usage: rho FILE [KEY=VAL...]\n";
+    exit 1;
 }
 
 sub fatal {
