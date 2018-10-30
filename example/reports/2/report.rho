@@ -1,4 +1,4 @@
-include ../../endpoints.rho
+include ../../databases.rho
 
 metadata {
     id        123;
