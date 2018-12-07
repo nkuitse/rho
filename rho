@@ -13,9 +13,10 @@ sub fatal;
 
 my %database;
 my %trx;
-my ($verbose);
+my (@includes, $verbose);
 
 GetOptions(
+    'i|include=s' => \@includes,
     'v|verbose' => \$verbose,
 );
 usage if !@ARGV;
@@ -116,6 +117,7 @@ sub prepare_sql {
 sub placeholder {
     my ($sigil, $key, $val, $bind) = @_;
     if ($sigil eq '$') {
+        return 'NULL' if !defined $val;
         if (ref($val)) {
             die if @$val > 1;
             ($val) = @$val;
@@ -224,6 +226,7 @@ sub read_report {
         'iosteps' => [],
         'finishers' => [],
     );
+    _read_file($_, \%report) for @includes;
     _read_file($f, \%report);
 }
 
@@ -358,11 +361,12 @@ sub _write_block {
 }
 
 sub _database {
-    return _keyval_block(qr/(database|source|destination|output)/, sub {
+    return _keyval_block(qr/database|source|destination|output/, sub {
         local $_ = shift;
         my ($k, $block) = @_;
         $block->{'read_only'} = 1 if $block->{'type'} eq 'source';
         $block->{'id'} = $block->{'title'} if defined $block->{'title'} && $block->{'id'} =~ /^(?:source|destination)$/;
+        $block->{'id'} //= 'output' if $block->{'type'} eq 'output';
         my $line = $k . ' ' . $_;
         if ($k =~ /^(dsn|user|password)$/) {
             return _quoted_string_value() // fatal "invalid $k: $line";
