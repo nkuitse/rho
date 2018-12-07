@@ -157,7 +157,8 @@ sub prepare_sql_file {
 
 sub dbh {
     my ($db) = @_;
-    my $database = ref($db) ? $db : $database{$db} // fatal "no such database: $db";
+    my $database = ref($db) ? $db : $database{$db}
+        or fatal "no such database: $db";
     return $database->{'dbh'} ||= DBI->connect(@$database{qw(dsn user password)}, { 'RaiseError' => 1, 'AutoCommit' => 1 });
 }
 
@@ -297,16 +298,21 @@ sub _metadata {
         local $_ = shift;
         my ($k) = @_;
         my $line = $k . ' ' . $_;
-        return _bareword() // _filepath() //_quoted_string_value()
-            // fatal "invalid metadata: $line";
+        my $tok = _bareword();
+            return $tok if defined $tok;
+        $tok = _filepath();
+            return $tok if defined $tok;
+        $tok = _quoted_string_value();
+            return $tok if defined $tok;
+        fatal "invalid metadata: $line";
     });
 }
 
 sub _iostep {
-    my $read = _read_block() // return;  # _string_block('read') // return;
+    my $read = _read_block() or return;  # _string_block('read') // return;
     _strip_comments();
     _strip_whitespace();
-    my $write = _write_block() // fatal "reader without writer";  # _string_block('write') // fatal "reader without writer";
+    my $write = _write_block() or fatal "reader without writer";  # _string_block('write') // fatal "reader without writer";
     return {
         'read' => $read,
         'write' => $write,
@@ -322,7 +328,9 @@ sub _read_block {
         from
         \s+
     }{}x;
-    my $database = _bareword() // fatal("expected database ID: ", (split /\n/, $_, 2)[0]);
+    my $database = _bareword();
+    fatal("expected database ID: ", (split /\n/, $_, 2)[0])
+        if !defined $database;
     fatal "incomplete read block"
         if !s{\A\s+\{\s*}{};
     my $body = '';
@@ -349,7 +357,7 @@ sub _write_block {
         \s+
         \{
     }{}x;
-    my $database = $1 // 'output';
+    my $database = defined $1 ? $1 : 'output';
     my $body = '';
     my %block = ('id' => $database);
     while (!s{\A\s*\}}{}) {
@@ -369,14 +377,19 @@ sub _database {
         $block->{'id'} //= 'output' if $block->{'type'} eq 'output';
         my $line = $k . ' ' . $_;
         if ($k =~ /^(dsn|user|password)$/) {
-            return _quoted_string_value() // fatal "invalid $k: $line";
+            my $tok = _quoted_string_value();
+            return $tok if defined $tok;
+            fatal "invalid $k: $line";
         }
         elsif ($k eq 'options') {
             my %opt;
             while (/\S/) {
-                my $opt = _bareword() // fatal "expected option key: $line";
+                my $opt = _bareword();
+                fatal "expected option key: $line"
+                    if !defined $opt;
                 s/\A\s+//;
-                my $val = _quoted_string_value() // 1;
+                my $val = _quoted_string_value();
+                $val = 1 if !defined $val;
                 $opt{$opt} = $val;
                 s/\A\s*,//;  # Optional comma
                 s/\A\s+//;
@@ -400,8 +413,10 @@ sub _parameters {
             my $w = _bareword() or fatal "unrecognized token in parameter definition: $line";
             if ($w =~ /^(default|hint|example|match(?:es|ing)?)$/) {
                 s{\A\s+}{} or fatal "parameter qualifier $w not followed by whitespace: $line";
-                my $v = _quoted_string_value() // _bareword()
-                    // fatal "parameter qualifier $w lacks required value: $line";
+                my $v = _quoted_string_value();
+                $v = _bareword() if !defined $v;
+                fatal "parameter qualifier $w lacks required value: $line"
+                    if !defined $v;
                 $qual{$w} = $v;
             }
             else {
