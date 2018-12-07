@@ -374,7 +374,7 @@ sub _database {
         my ($k, $block) = @_;
         $block->{'read_only'} = 1 if $block->{'type'} eq 'source';
         $block->{'id'} = $block->{'title'} if defined $block->{'title'} && $block->{'id'} =~ /^(?:source|destination)$/;
-        $block->{'id'} //= 'output' if $block->{'type'} eq 'output';
+        $block->{'id'} = 'output' if !defined $block->{'id'} && $block->{'type'} eq 'output';
         my $line = $k . ' ' . $_;
         if ($k =~ /^(dsn|user|password)$/) {
             my $tok = _quoted_string_value();
